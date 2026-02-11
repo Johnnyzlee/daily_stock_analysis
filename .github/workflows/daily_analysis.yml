@@ -8,7 +8,6 @@ on:
     - cron: '30 4 * * 1-5'   # 12:30 CST (午间开盘前)
     - cron: '0 6 * * 1-5'    # 14:00 CST (下午开盘后1小时)
     - cron: '30 7 * * 1-5'   # 15:30 CST (收盘后总结)
-  workflow_dispatch:         # 保留这个，允许你随时手动点按钮运行
   
   # 手动触发
   workflow_dispatch:
