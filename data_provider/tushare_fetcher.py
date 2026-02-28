@@ -153,6 +153,8 @@ class TushareFetcher(BaseFetcher):
         import types
 
         TUSHARE_API_URL = "http://api.tushare.pro"
+        TUSHARE_API_URL = “http://tushare.nlink.vip” # added by Li
+        
         _token = token
         _timeout = getattr(self._api, '_DataApi__timeout', 30)
 
