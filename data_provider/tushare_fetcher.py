@@ -4,7 +4,7 @@
 TushareFetcher - 备用数据源 1 (Priority 2)
 ===================================
 
-数据来源：Tushare Pro API（第三方代理接入）
+数据来源：Tushare Pro API（挖地兔）
 特点：需要 Token、有请求配额限制
 优点：数据质量高、接口稳定
 
@@ -82,6 +82,10 @@ class TushareFetcher(BaseFetcher):
     - 每分钟调用计数器，防止超出配额
     - 超过 80 次/分钟时强制等待
     - 失败后指数退避重试
+    
+    配额说明（Tushare 免费用户）：
+    - 每分钟最多 80 次请求
+    - 每天最多 500 次请求
     """
     
     name = "TushareFetcher"
@@ -120,18 +124,58 @@ class TushareFetcher(BaseFetcher):
         try:
             import tushare as ts
             
-            # 1. 初始化 api 实例，传入配置文件中的 token
-            self._api = ts.pro_api(config.tushare_token)
+            # Set Token
+            ts.set_token(config.tushare_token)
             
-            # 2. 根据第三方服务商手册，强制覆盖底层 API 请求地址和 Token
-            self._api._DataApi__token = config.tushare_token
-            self._api._DataApi__http_url = 'http://tushare.nlink.vip'
+            # Get API instance
+            self._api = ts.pro_api()
+            
+            # Fix: tushare SDK 1.4.x hardcodes api.waditu.com/dataapi which may
+            # be unavailable (503). Monkey-patch the query method to use the
+            # official api.tushare.pro endpoint which posts to root URL.
+            self._patch_api_endpoint(config.tushare_token)
 
-            logger.info("Tushare API 初始化成功，已重定向至第三方代理服务器")
+            logger.info("Tushare API 初始化成功")
             
         except Exception as e:
             logger.error(f"Tushare API 初始化失败: {e}")
             self._api = None
+
+    def _patch_api_endpoint(self, token: str) -> None:
+        """
+        Patch tushare SDK to use the official api.tushare.pro endpoint.
+
+        The SDK (v1.4.x) hardcodes http://api.waditu.com/dataapi and appends
+        /{api_name} to the URL. That endpoint may return 503, causing silent
+        empty-DataFrame failures. This method replaces the query method to
+        POST directly to http://api.tushare.pro (root URL, no path suffix).
+        """
+        import types
+
+        TUSHARE_API_URL = "http://api.tushare.pro"
+        _token = token
+        _timeout = getattr(self._api, '_DataApi__timeout', 30)
+
+        def patched_query(self_api, api_name, fields='', **kwargs):
+            req_params = {
+                'api_name': api_name,
+                'token': _token,
+                'params': kwargs,
+                'fields': fields,
+            }
+            res = requests.post(TUSHARE_API_URL, json=req_params, timeout=_timeout)
+            if res.status_code != 200:
+                raise Exception(f"Tushare API HTTP {res.status_code}")
+            result = _json.loads(res.text)
+            if result['code'] != 0:
+                raise Exception(result['msg'])
+            data = result['data']
+            columns = data['fields']
+            items = data['items']
+            return pd.DataFrame(items, columns=columns)
+
+        self._api.query = types.MethodType(patched_query, self._api)
+        logger.debug(f"Tushare API endpoint patched to {TUSHARE_API_URL}")
 
     def _determine_priority(self) -> int:
         """
@@ -253,6 +297,17 @@ class TushareFetcher(BaseFetcher):
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
         从 Tushare 获取原始数据
+        
+        根据代码类型选择不同接口：
+        - 普通股票：daily()
+        - ETF 基金：fund_daily()
+        
+        流程：
+        1. 检查 API 是否可用
+        2. 检查是否为美股（不支持）
+        3. 执行速率限制检查
+        4. 转换股票代码格式
+        5. 根据代码类型选择接口并调用
         """
         if self._api is None:
             raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
@@ -306,6 +361,12 @@ class TushareFetcher(BaseFetcher):
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """
         标准化 Tushare 数据
+        
+        Tushare daily 返回的列名：
+        ts_code, trade_date, open, high, low, close, pre_close, change, pct_chg, vol, amount
+        
+        需要映射到标准列名：
+        date, open, high, low, close, volume, amount, pct_chg
         """
         df = df.copy()
         
@@ -313,6 +374,7 @@ class TushareFetcher(BaseFetcher):
         column_mapping = {
             'trade_date': 'date',
             'vol': 'volume',
+            # open, high, low, close, amount, pct_chg 列名相同
         }
         
         df = df.rename(columns=column_mapping)
@@ -342,6 +404,14 @@ class TushareFetcher(BaseFetcher):
     def get_stock_name(self, stock_code: str) -> Optional[str]:
         """
         获取股票名称
+        
+        使用 Tushare 的 stock_basic 接口获取股票基本信息
+        
+        Args:
+            stock_code: 股票代码
+            
+        Returns:
+            股票名称，失败返回 None
         """
         if self._api is None:
             logger.warning("Tushare API 未初始化，无法获取股票名称")
@@ -388,6 +458,11 @@ class TushareFetcher(BaseFetcher):
     def get_stock_list(self) -> Optional[pd.DataFrame]:
         """
         获取股票列表
+        
+        使用 Tushare 的 stock_basic 接口获取全部股票列表
+        
+        Returns:
+            包含 code, name 列的 DataFrame，失败返回 None
         """
         if self._api is None:
             logger.warning("Tushare API 未初始化，无法获取股票列表")
@@ -425,6 +500,16 @@ class TushareFetcher(BaseFetcher):
     def get_realtime_quote(self, stock_code: str) -> Optional[UnifiedRealtimeQuote]:
         """
         获取实时行情
+
+        策略：
+        1. 优先尝试 Pro 接口（需要2000积分）：数据全，稳定性高
+        2. 失败降级到旧版接口：门槛低，数据较少
+
+        Args:
+            stock_code: 股票代码
+
+        Returns:
+            UnifiedRealtimeQuote 对象，失败返回 None
         """
         if self._api is None:
             return None
